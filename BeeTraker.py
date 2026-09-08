@@ -5,7 +5,7 @@ from datetime import datetime
 from picamera2 import Picamera2
 from libcamera import controls
 from datetime import datetime, time
-
+from scipy.optimize import linear_sum_assignment
 
 
 DB_PATH = "/home/david/Documents/RPi5/BeeTracker/hive_activity.db"
@@ -91,14 +91,17 @@ class CentroidTracker:
             axis=2,
         )
 
-        # Greedily match smallest distances first
-        rows = D.min(axis=1).argsort()
-        cols = D.argmin(axis=1)[rows]
+        # Globally optimal matching (Hungarian algorithm) rather than
+        # greedy nearest-first. This matters most right after a merged
+        # blob splits back into separate detections: two candidate IDs can
+        # both be close to both new centroids, and greedy matching (which
+        # locks in whichever pair happens to have the smallest distance
+        # first) can swap the two IDs. Minimizing total assignment distance
+        # across every pair at once avoids that swap far more often.
+        row_ind, col_ind = linear_sum_assignment(D)
 
         used_rows, used_cols = set(), set()
-        for row, col in zip(rows, cols):
-            if row in used_rows or col in used_cols:
-                continue
+        for row, col in zip(row_ind, col_ind):
             if D[row, col] > self.max_match_distance:
                 continue
             object_id = object_ids[row]
@@ -122,6 +125,79 @@ class CentroidTracker:
             self.register(input_centroids[col])
 
         return self.objects
+
+
+def estimate_bee_count(area, single_bee_area):
+    """How many bees a contour of this area probably contains, given the
+    current running estimate of one bee's contour area."""
+    if single_bee_area <= 0:
+        return 1
+    return max(1, round(area / single_bee_area))
+
+
+def split_merged_blob(mask_roi, offset, expected_count, min_region_area):
+    """
+    Split a blob mask that looks like `expected_count` touching/overlapping
+    bees into that many separate boxes, using a distance-transform +
+    watershed (the standard OpenCV technique for separating touching
+    objects - the same one used for touching-coin/cell segmentation).
+
+    mask_roi: binary (0/255) uint8 mask, cropped to the blob's bounding box.
+    offset: (x, y) of that crop's top-left corner in the full frame, so
+            returned boxes can be translated back to full-frame coordinates.
+    min_region_area: a resulting piece smaller than this is treated as a
+            leg/antenna artifact rather than a real second bee, and voids
+            the whole split (a single lumpy bee - head/thorax/abdomen/legs -
+            can otherwise produce more than one distance-transform peak and
+            get chopped into fragments of one real bee).
+    Returns a list of (x, y, w, h) boxes, or None if a confident split
+    couldn't be found (caller should then fall back to one big box).
+    """
+    if expected_count <= 1:
+        return None
+
+    # Distance transform: pixels deep inside a bee are "brighter" than
+    # pixels near its edge or near the touching seam with a neighbor.
+    dist = cv2.distanceTransform(mask_roi, cv2.DIST_L2, 5)
+    if dist.max() <= 0:
+        return None
+
+    # Local maxima of the distance map = likely bee centers. Require a
+    # fairly high fraction of the peak distance so shallow bumps from a
+    # single bee's own body shape (not a real second bee) don't count.
+    kernel = np.ones((9, 9), np.uint8)
+    local_max = (dist == cv2.dilate(dist, kernel)) & (dist > 0.6 * dist.max())
+    num_peaks, markers = cv2.connectedComponents(local_max.astype(np.uint8))
+
+    # Wrong number of distinct peaks (too few OR too many): not confident
+    # enough to split - safer to leave it as one box than guess wrong.
+    if num_peaks - 1 != expected_count:
+        return None
+
+    markers = markers + 1
+    # Outside the blob is "sure background" (label 1, left as-is). Inside
+    # the blob but not at a peak is the ambiguous seam between bees -
+    # that's what watershed needs to flood and assign, so mark it unknown.
+    markers[(mask_roi > 0) & (local_max == 0)] = 0
+    mask_bgr = cv2.cvtColor(mask_roi, cv2.COLOR_GRAY2BGR)
+    cv2.watershed(mask_bgr, markers)
+
+    ox, oy = offset
+    boxes = []
+    for label in range(2, markers.max() + 1):
+        region = np.uint8(markers == label) * 255
+        region_area = cv2.countNonZero(region)
+        # Any piece too small to plausibly be a whole bee (a leg, an
+        # antenna, a sliver from an uneven split) invalidates the whole
+        # split rather than being silently dropped - a bee missing its
+        # body isn't a usable detection, and dropping it would also throw
+        # off the expected_count vs len(boxes) bookkeeping upstream.
+        if region_area < min_region_area:
+            return None
+        x, y, w, h = cv2.boundingRect(region)
+        boxes.append((x + ox, y + oy, w, h))
+
+    return boxes if len(boxes) == expected_count else None
 
 
 def get_vertical_direction(prev_point, curr_point, min_movement=6):
@@ -191,7 +267,7 @@ def main():
     last_seen_direction = {}     # object_id -> last known direction ('Up'/'Down')
     last_moving_frame = {}       # object_id -> frame_count when it last registered movement
     frame_count = 0
-    PERSISTENCE_FRAMES = 60      # how many frames to keep showing a stopped object (at 30fps)
+    PERSISTENCE_FRAMES = 150      # how many frames to keep showing a stopped object (at 30fps)
 
     # Fraction of frame height that counts as the "top" / "bottom" entry-exit
     # zones. An object must be seen in one zone and later seen in the
@@ -203,6 +279,23 @@ def main():
     # that reverses direction before reaching the far zone doesn't count.
     top_to_bottom_count = 0
     bottom_to_top_count = 0
+
+    # --- Merged-blob splitting ---
+    # Running estimate of a single bee's contour area, used to guess how
+    # many bees are inside an oversized contour so it can be split back
+    # apart. This is *auto-calibrated* from the first several seconds of
+    # real detections (median of normal-sized contours) rather than a
+    # fixed guess - a hardcoded seed that doesn't match your actual
+    # zoom/crop makes ordinary single bees look "merged" and get split
+    # apart for no reason, which is what produced the multi-ID-per-bee
+    # result you saw.
+    CALIBRATION_FRAMES = 90          # ~3s at 30fps: splitting is off during this
+    calibration_areas = []
+    single_bee_area = None           # None = still calibrating, splitting disabled
+    AREA_EMA_ALPHA = 0.05            # how fast the estimate adapts after calibration
+    MERGE_AREA_RATIO = 2.2           # contour this many x the estimate = "merged"
+    MIN_SPLIT_REGION_RATIO = 0.5     # a split piece smaller than this x the estimate
+                                      # is a leg/artifact, not a real second bee
 
     # --- Six-minute interval logging to SQLite ---
     # We log the *delta* since the last snapshot, not the running total,
@@ -227,10 +320,16 @@ def main():
             # so a single inRange call is all that's needed here)
             mask = cv2.inRange(hsv, lower_color, upper_color)
             
-            # Morphological transformations to filter out tiny background noise
-            kernel = np.ones((5, 5), np.uint8)
+            # Morphological transformations to filter out tiny background
+            # noise. An elliptical kernel and a net-neutral erode/dilate
+            # (rather than dilate-more-than-erode) keeps bees that are
+            # merely close together from being padded into touching one
+            # another - the previous 1-erode/2-dilate combo grew the mask
+            # outward on net, which made near-misses turn into actual
+            # merges more often than necessary.
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             mask = cv2.erode(mask, kernel, iterations=1)
-            mask = cv2.dilate(mask, kernel, iterations=2)
+            mask = cv2.dilate(mask, kernel, iterations=1)
             
             # 5. Find boundaries (contours) of all filtered objects
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -247,15 +346,63 @@ def main():
             valid_contours = valid_contours[:MAX_OBJECTS]
             
             # Map each contour's centroid to its bounding box so we can
-            # look the box back up after the tracker assigns IDs
+            # look the box back up after the tracker assigns IDs. Contours
+            # much larger than a single bee are assumed to be multiple
+            # bees touching/overlapping and get split before being handed
+            # to the tracker, instead of becoming one oversized box that
+            # swallows several IDs. Splitting only runs once single_bee_area
+            # has been calibrated from real data (see below) - before that,
+            # every contour is treated as one object, same as originally.
             centroids = []
             boxes = {}
             for contour in valid_contours:
                 x, y, w, h = cv2.boundingRect(contour)
-                center_x = int(x + (w / 2))
-                center_y = int(y + (h / 2))
-                centroids.append((center_x, center_y))
-                boxes[(center_x, center_y)] = (x, y, w, h)
+                area = cv2.contourArea(contour)
+
+                expected_count = 1
+                if single_bee_area is not None:
+                    expected_count = estimate_bee_count(area, single_bee_area)
+
+                split_boxes = None
+                if expected_count > 1:
+                    pad = 3
+                    rx = max(x - pad, 0)
+                    ry = max(y - pad, 0)
+                    rw = min(x + w + pad, mask.shape[1]) - rx
+                    rh = min(y + h + pad, mask.shape[0]) - ry
+                    blob_mask = np.zeros((rh, rw), dtype=np.uint8)
+                    cv2.drawContours(blob_mask, [contour], -1, 255, -1, offset=(-rx, -ry))
+                    min_region_area = single_bee_area * MIN_SPLIT_REGION_RATIO
+                    split_boxes = split_merged_blob(blob_mask, (rx, ry), expected_count, min_region_area)
+
+                if split_boxes:
+                    for (bx, by, bw, bh) in split_boxes:
+                        cx = int(bx + bw / 2)
+                        cy = int(by + bh / 2)
+                        centroids.append((cx, cy))
+                        boxes[(cx, cy)] = (bx, by, bw, bh)
+                else:
+                    center_x = int(x + (w / 2))
+                    center_y = int(y + (h / 2))
+                    centroids.append((center_x, center_y))
+                    boxes[(center_x, center_y)] = (x, y, w, h)
+
+                    if single_bee_area is None:
+                        # Still in the calibration window: collect this as
+                        # a sample of "what one bee's contour area looks
+                        # like" (a few merged bees in the mix won't hurt -
+                        # the median below is robust to that).
+                        calibration_areas.append(area)
+                    elif area < single_bee_area * MERGE_AREA_RATIO:
+                        # Only let contours that look like a single bee
+                        # (not a merge we failed to split) refine the
+                        # estimate, so one big blob doesn't drag it upward.
+                        single_bee_area = (1 - AREA_EMA_ALPHA) * single_bee_area + AREA_EMA_ALPHA * area
+
+            if single_bee_area is None and frame_count >= CALIBRATION_FRAMES and calibration_areas:
+                single_bee_area = float(np.median(calibration_areas))
+                print(f"Calibrated single-bee contour area: {single_bee_area:.0f} "
+                      f"(from {len(calibration_areas)} samples)")
             
             # 6. Update the tracker to get a stable ID -> centroid mapping
             tracked_objects = tracker.update(centroids)
@@ -310,7 +457,6 @@ def main():
                     frames_since_moving = frame_count - last_moving_frame.get(object_id, -PERSISTENCE_FRAMES - 1)
                     if frames_since_moving > PERSISTENCE_FRAMES:
                         DRAW_BOX = False
-                    DRAW_BOX = True
                     # Use the last known box/direction rather than the
                     # (possibly stale/absent) current detection so the box
                     # doesn't jump if the contour was momentarily lost
@@ -329,8 +475,8 @@ def main():
                 cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
 
                 # Display ID, coordinates, and direction of travel
+                label = f"ID {object_id}"
                 if DRAW_BOX:
-                    label = f"ID {object_id}"
                     cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
             
             previous_positions = current_positions
