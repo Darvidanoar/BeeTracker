@@ -195,12 +195,29 @@ def group_nearby_contours(contours, max_gap, fragment_max_area):
     return list(groups.values())
 
 
-def estimate_bee_count(area, single_bee_area):
+def estimate_bee_count(area, single_bee_area, merge_trigger_ratio=1.8):
     """How many bees a contour of this area probably contains, given the
-    current running estimate of one bee's contour area."""
+    current running estimate of one bee's contour area.
+
+    A single bee's own contour area naturally varies a lot with pose -
+    legs splayed out or a slight motion-blur elongation can push it to
+    1.3-1.5x its resting size - and its body already has two lobes
+    (thorax/abdomen), so a watershed split can succeed on a single bee
+    just as easily as on two touching ones. Naively rounding
+    area/single_bee_area starts guessing "2" as soon as the ratio
+    passes 1.5, which sits right in that normal single-bee range and
+    was splitting ordinary bees into two IDs on almost every frame.
+    Requiring a bigger jump (merge_trigger_ratio) before ever
+    considering more than one bee avoids that false positive while
+    still catching genuinely touching/overlapping bees, whose combined
+    area lands well past it.
+    """
     if single_bee_area <= 0:
         return 1
-    return max(1, round(area / single_bee_area))
+    ratio = area / single_bee_area
+    if ratio < merge_trigger_ratio:
+        return 1
+    return max(2, round(ratio))
 
 
 def split_merged_blob(mask_roi, offset, expected_count, min_region_area):
@@ -362,7 +379,18 @@ def main():
                                        # zoom/crop
     single_bee_area = DEFAULT_SINGLE_BEE_AREA
     AREA_EMA_ALPHA = 0.05            # how fast the estimate adapts from the default
-    MERGE_AREA_RATIO = 2.2           # contour this many x the estimate = "merged"
+    MERGE_TRIGGER_RATIO = 1.8        # contour must be at least this many x the
+                                      # estimate before it's even considered as
+                                      # possibly more than one bee - comfortably
+                                      # above the ~1.2-1.5x a single bee's own
+                                      # contour can naturally reach from pose or
+                                      # motion (see estimate_bee_count)
+    MIN_SINGLE_SAMPLE_RATIO = 0.7    # a contour classified as a single bee but
+                                      # smaller than this x the estimate is
+                                      # probably a partial/edge-cropped view, not
+                                      # a reliable sample of a whole bee's area -
+                                      # excluded from the running estimate so it
+                                      # can't drag it down over time
     MIN_SPLIT_REGION_RATIO = 0.5     # a split piece smaller than this x the estimate
                                       # is a leg/artifact, not a real second bee
     FRAGMENT_AREA_RATIO = 0.55       # a contour smaller than this x the estimate is
@@ -449,7 +477,7 @@ def main():
                 w, h = x2 - x, y2 - y
                 area = sum(cv2.contourArea(c) for c in group)
 
-                expected_count = estimate_bee_count(area, single_bee_area)
+                expected_count = estimate_bee_count(area, single_bee_area, MERGE_TRIGGER_RATIO)
 
                 split_boxes = None
                 if expected_count > 1:
@@ -475,10 +503,13 @@ def main():
                     centroids.append((center_x, center_y))
                     boxes[(center_x, center_y)] = (x, y, w, h)
 
-                    if area < single_bee_area * MERGE_AREA_RATIO:
-                        # Only let contours that look like a single bee
-                        # (not a merge we failed to split) refine the
-                        # estimate, so one big blob doesn't drag it upward.
+                    if expected_count == 1 and area >= single_bee_area * MIN_SINGLE_SAMPLE_RATIO:
+                        # Only refine the estimate from a contour that (a) was
+                        # never even considered a possible merge, and (b) isn't
+                        # a suspiciously small/partial view - so a failed split
+                        # of a real multi-bee blob, or a bee cropped by the
+                        # frame edge, can't drag the estimate away from what a
+                        # whole bee actually looks like.
                         single_bee_area = (1 - AREA_EMA_ALPHA) * single_bee_area + AREA_EMA_ALPHA * area
 
             # 6. Update the tracker to get a stable ID -> centroid mapping
@@ -520,6 +551,10 @@ def main():
                 prev_point = previous_positions.get(object_id, centroid)
                 v_direction = get_vertical_direction(prev_point, centroid)
 
+                # A real detection this frame (not just a carried-over
+                # position from a frame or two of no match) means `boxes`
+                # has an entry keyed by this exact centroid.
+                detected_this_frame = centroid in boxes
                 x, y, w, h = boxes.get(centroid, (center_x - 25, center_y - 25, 50, 50))
 
                 if v_direction is not None:
@@ -534,10 +569,21 @@ def main():
                     frames_since_moving = frame_count - last_moving_frame.get(object_id, -PERSISTENCE_FRAMES - 1)
                     if frames_since_moving > PERSISTENCE_FRAMES:
                         DRAW_BOX = False
-                    # Use the last known box/direction rather than the
-                    # (possibly stale/absent) current detection so the box
-                    # doesn't jump if the contour was momentarily lost
-                    x, y, w, h = last_seen_box.get(object_id, (x, y, w, h))
+                    if detected_this_frame:
+                        # The bee is genuinely still right here, just not
+                        # moving fast enough this frame to count as
+                        # "moving" - keep last_seen_box in sync so a slow,
+                        # gradual walk doesn't leave the box drifting
+                        # behind the bee's real position (each individual
+                        # frame's step can be under min_movement even
+                        # while the bee steadily walks away over several
+                        # seconds).
+                        last_seen_box[object_id] = (x, y, w, h)
+                    else:
+                        # No detection at all this frame - fall back to
+                        # the last known box rather than the generic
+                        # placeholder so the box doesn't jump.
+                        x, y, w, h = last_seen_box.get(object_id, (x, y, w, h))
                     is_stopped = True
 
                 # Stopped objects are drawn in a different color (yellow)
