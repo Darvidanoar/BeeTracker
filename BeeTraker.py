@@ -1,11 +1,12 @@
 import cv2
+import math
 import numpy as np
 import sqlite3
 from datetime import datetime
 from picamera2 import Picamera2
 from libcamera import controls
-from datetime import datetime, time
 from scipy.optimize import linear_sum_assignment
+from datetime import datetime, time
 
 
 DB_PATH = "/home/david/Documents/RPi5/BeeTracker/hive_activity.db"
@@ -125,6 +126,73 @@ class CentroidTracker:
             self.register(input_centroids[col])
 
         return self.objects
+
+
+def rect_distance(box1, box2):
+    """Gap between two (x, y, w, h) boxes: 0 if they overlap/touch,
+    otherwise the Euclidean distance between their nearest edges."""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    dx = max(x1 - (x2 + w2), x2 - (x1 + w1), 0)
+    dy = max(y1 - (y2 + h2), y2 - (y1 + h1), 0)
+    return math.hypot(dx, dy)
+
+
+def group_nearby_contours(contours, max_gap, fragment_max_area):
+    """
+    Cluster contours that sit within max_gap pixels of each other (by
+    bounding-box distance) into groups, treating each group as one blob -
+    but only when BOTH contours being joined are individually smaller
+    than fragment_max_area (too small to plausibly be a whole bee on
+    their own).
+
+    This exists to undo a specific failure mode: as a bee shifts pose,
+    the thin waist between its thorax and abdomen can be thinner than
+    the erosion kernel used for mask cleanup, so the morphological
+    "opening" briefly erases it and RETR_EXTERNAL reports the same bee
+    as two separate, individually-undersized contours for a frame or
+    two. Left alone, that mints a second tracker ID for the second
+    piece, which then gets dropped when the blob reunites - and
+    whichever ID survives the merge is a coin flip, so the bee can end
+    up with a new ID after simply moving.
+
+    The fragment_max_area gate matters because bees standing right next
+    to each other at the hive entrance are common, and each one's own
+    contour is already whole-bee-sized - merging those together just
+    because they're close would recreate the "several bees look like
+    one blob" problem this function is meant to avoid, only earlier in
+    the pipeline where split_merged_blob never gets a chance to run on
+    them individually.
+    """
+    n = len(contours)
+    boxes = [cv2.boundingRect(c) for c in contours]
+    areas = [cv2.contourArea(c) for c in contours]
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        if areas[i] >= fragment_max_area:
+            continue
+        for j in range(i + 1, n):
+            if areas[j] >= fragment_max_area:
+                continue
+            if rect_distance(boxes[i], boxes[j]) <= max_gap:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(contours[i])
+    return list(groups.values())
 
 
 def estimate_bee_count(area, single_bee_area):
@@ -283,19 +351,29 @@ def main():
     # --- Merged-blob splitting ---
     # Running estimate of a single bee's contour area, used to guess how
     # many bees are inside an oversized contour so it can be split back
-    # apart. This is *auto-calibrated* from the first several seconds of
-    # real detections (median of normal-sized contours) rather than a
-    # fixed guess - a hardcoded seed that doesn't match your actual
-    # zoom/crop makes ordinary single bees look "merged" and get split
-    # apart for no reason, which is what produced the multi-ID-per-bee
-    # result you saw.
-    CALIBRATION_FRAMES = 90          # ~3s at 30fps: splitting is off during this
-    calibration_areas = []
-    single_bee_area = None           # None = still calibrating, splitting disabled
-    AREA_EMA_ALPHA = 0.05            # how fast the estimate adapts after calibration
+    # apart. Seeded with a fixed default (median single-bee contour area
+    # measured from a reference frame, Bees.png, using this same
+    # detection pipeline) instead of auto-calibrating from the first few
+    # seconds of live detections - at the start of the day there are no
+    # bees yet to calibrate from, so that window just expired with no
+    # samples and splitting stayed permanently disabled.
+    DEFAULT_SINGLE_BEE_AREA = 1858    # median contour area of 7 clean single-bee
+                                       # detections in Bees.png at this camera's
+                                       # zoom/crop
+    single_bee_area = DEFAULT_SINGLE_BEE_AREA
+    AREA_EMA_ALPHA = 0.05            # how fast the estimate adapts from the default
     MERGE_AREA_RATIO = 2.2           # contour this many x the estimate = "merged"
     MIN_SPLIT_REGION_RATIO = 0.5     # a split piece smaller than this x the estimate
                                       # is a leg/artifact, not a real second bee
+    FRAGMENT_AREA_RATIO = 0.55       # a contour smaller than this x the estimate is
+                                      # too small to be a whole bee on its own, so it's
+                                      # a candidate to re-join a nearby same-size
+                                      # fragment (see group_nearby_contours) - a
+                                      # contour at or above this is treated as a
+                                      # complete bee and never merged just for being
+                                      # close to another one
+    FRAGMENT_MERGE_GAP = 15          # pixels; how close two fragment-sized contours
+                                      # must be to be considered pieces of one bee
 
     # --- Six-minute interval logging to SQLite ---
     # We log the *delta* since the last snapshot, not the running total,
@@ -337,31 +415,41 @@ def main():
             # Minimum pixel area threshold to prevent tracking tiny artifacts
             MIN_AREA = 500
             
-            # Keep every contour big enough to be a real object, largest first
+            # Keep every contour big enough to be a real object
             valid_contours = [c for c in contours if cv2.contourArea(c) > MIN_AREA]
-            valid_contours.sort(key=cv2.contourArea, reverse=True)
-            
-            # Optional cap so a noisy frame doesn't spam dozens of boxes
+
+            # Re-join contours that are probably fragments of the same bee
+            # (see group_nearby_contours) before deciding how many bees a
+            # blob contains, so a momentary mask split doesn't get handed
+            # to the tracker as a second object.
+            groups = group_nearby_contours(
+                valid_contours, FRAGMENT_MERGE_GAP, single_bee_area * FRAGMENT_AREA_RATIO
+            )
+
+            # Largest first, then an optional cap so a noisy frame doesn't
+            # spam dozens of boxes
+            groups.sort(key=lambda g: sum(cv2.contourArea(c) for c in g), reverse=True)
             MAX_OBJECTS = 33
-            valid_contours = valid_contours[:MAX_OBJECTS]
-            
-            # Map each contour's centroid to its bounding box so we can
-            # look the box back up after the tracker assigns IDs. Contours
+            groups = groups[:MAX_OBJECTS]
+
+            # Map each group's centroid to its bounding box so we can
+            # look the box back up after the tracker assigns IDs. Groups
             # much larger than a single bee are assumed to be multiple
             # bees touching/overlapping and get split before being handed
             # to the tracker, instead of becoming one oversized box that
-            # swallows several IDs. Splitting only runs once single_bee_area
-            # has been calibrated from real data (see below) - before that,
-            # every contour is treated as one object, same as originally.
+            # swallows several IDs.
             centroids = []
             boxes = {}
-            for contour in valid_contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                area = cv2.contourArea(contour)
+            for group in groups:
+                group_boxes = [cv2.boundingRect(c) for c in group]
+                x = min(bx for bx, by, bw, bh in group_boxes)
+                y = min(by for bx, by, bw, bh in group_boxes)
+                x2 = max(bx + bw for bx, by, bw, bh in group_boxes)
+                y2 = max(by + bh for bx, by, bw, bh in group_boxes)
+                w, h = x2 - x, y2 - y
+                area = sum(cv2.contourArea(c) for c in group)
 
-                expected_count = 1
-                if single_bee_area is not None:
-                    expected_count = estimate_bee_count(area, single_bee_area)
+                expected_count = estimate_bee_count(area, single_bee_area)
 
                 split_boxes = None
                 if expected_count > 1:
@@ -371,7 +459,7 @@ def main():
                     rw = min(x + w + pad, mask.shape[1]) - rx
                     rh = min(y + h + pad, mask.shape[0]) - ry
                     blob_mask = np.zeros((rh, rw), dtype=np.uint8)
-                    cv2.drawContours(blob_mask, [contour], -1, 255, -1, offset=(-rx, -ry))
+                    cv2.drawContours(blob_mask, group, -1, 255, -1, offset=(-rx, -ry))
                     min_region_area = single_bee_area * MIN_SPLIT_REGION_RATIO
                     split_boxes = split_merged_blob(blob_mask, (rx, ry), expected_count, min_region_area)
 
@@ -387,23 +475,12 @@ def main():
                     centroids.append((center_x, center_y))
                     boxes[(center_x, center_y)] = (x, y, w, h)
 
-                    if single_bee_area is None:
-                        # Still in the calibration window: collect this as
-                        # a sample of "what one bee's contour area looks
-                        # like" (a few merged bees in the mix won't hurt -
-                        # the median below is robust to that).
-                        calibration_areas.append(area)
-                    elif area < single_bee_area * MERGE_AREA_RATIO:
+                    if area < single_bee_area * MERGE_AREA_RATIO:
                         # Only let contours that look like a single bee
                         # (not a merge we failed to split) refine the
                         # estimate, so one big blob doesn't drag it upward.
                         single_bee_area = (1 - AREA_EMA_ALPHA) * single_bee_area + AREA_EMA_ALPHA * area
 
-            if single_bee_area is None and frame_count >= CALIBRATION_FRAMES and calibration_areas:
-                single_bee_area = float(np.median(calibration_areas))
-                print(f"Calibrated single-bee contour area: {single_bee_area:.0f} "
-                      f"(from {len(calibration_areas)} samples)")
-            
             # 6. Update the tracker to get a stable ID -> centroid mapping
             tracked_objects = tracker.update(centroids)
             
